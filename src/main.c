@@ -39,12 +39,20 @@ struct icmp_io{
     int s;
 };
 
+struct icmp_timeout{
+    ev_timer t;
+    void *r;  // Result*
+};
+
 typedef struct Result{
     uint16_t id;
     struct timeval t_out;
     struct timeval t_in;
     double delta;
     int dublicate;
+    int flag_timeout;
+    void *host; //host*
+    struct icmp_timeout icmp_t;
     struct Result *ptr_next;
     struct Result *ptr_prev;
 } Result;
@@ -54,6 +62,7 @@ typedef struct host{
     char name[STRLEN];
     ev_tstamp interval;
     ev_tstamp offset;
+    ev_tstamp delay;
     struct sockaddr_in addr;
     struct icmp_periodic icmp_p;
     int s;
@@ -82,11 +91,13 @@ SGLIB_DEFINE_DL_LIST_FUNCTIONS(Result, RESULT_COMPARATOR, ptr_prev, ptr_next);
 // global hash
 
 host *hosts[HASH_TAB_SIZE];
+struct ev_loop *loop;
 
 int main(int argc, const char *argv[]){
     dictionary* ini=NULL;
     double default_interval;
     double default_offset;
+    double default_delay;
     int i,s;
 
     if(argc != 2){
@@ -104,12 +115,14 @@ int main(int argc, const char *argv[]){
         return 1;
     }
 
-    struct ev_loop *loop = ev_default_loop(0);  // ev loop!!
+    loop = ev_default_loop(0);  // ev loop!!
 
     ini = iniparser_load(argv[1]);
+    // load default values
     default_interval = iniparser_getdouble(ini, "default:interval", 6.0);
     default_offset = iniparser_getdouble(ini, "default:offset", 1.0);
-    printf("default interval %.2f default offset %.2f\n", default_interval, default_offset);
+    default_delay = iniparser_getdouble(ini, "default:delay", 2.0);
+    printf("defaults interval %.2f offset %.2f delay %.2f\n", default_interval, default_offset, default_delay);
     sglib_hashed_host_init(hosts);
 
     for(i=0;i<iniparser_getnsec(ini);i++){
@@ -120,7 +133,7 @@ int main(int argc, const char *argv[]){
             if(sglib_hashed_host_find_member(hosts, &t) == NULL){
                 host *t;
                 char key[STRLEN]; 
-                ev_tstamp interval, offset;
+                ev_tstamp interval, offset, delay;
                 char *ip;
 
                 // parse ini section
@@ -137,6 +150,10 @@ int main(int argc, const char *argv[]){
                 strncat(key, ":offset", STRLEN);
                 offset = iniparser_getdouble(ini, key, default_offset); 
 
+                strncpy(key, secname, STRLEN);
+                strncat(key, ":delay", STRLEN);
+                delay = iniparser_getdouble(ini, key, default_delay); 
+
 
                 // create host structure
 
@@ -147,6 +164,7 @@ int main(int argc, const char *argv[]){
                 t->addr.sin_addr.s_addr = inet_addr(ip);
                 t->interval = interval;
                 t->offset = offset;
+                t->delay = delay;
                 t->s = s; // socket
                 t->icmp_p.host = t;
                 t->count = 0;
@@ -159,9 +177,7 @@ int main(int argc, const char *argv[]){
 
                 sglib_hashed_host_add(hosts, t);
 
-                printf("add %s with ip:%s and interval:%.2f\n", secname, ip, interval);
-            }else{
-                printf("dublicate %s\n", secname);
+                //printf("add %s with ip:%s and interval:%.2f\n", secname, ip, interval);
             }
         }
     }
@@ -198,8 +214,16 @@ unsigned short checksum_ip(unsigned char *_addr, int count) {
     return ~sum;
 }
 
+void icmp_timeout_cb(struct ev_loop *loop, struct ev_timer *w_, int revents){
+    struct icmp_timeout *w = (struct icmp_timeout*) w_;
+    Result *r = (Result*)w->r;
+    r->flag_timeout=1;
+    host *h = (host*)r->host;
+    printf("timeout for %s\n",  inet_ntoa(h->addr.sin_addr));
+}
 
-void icmp_periodic_cb (struct ev_loop *loop, ev_periodic *w_, int revents){
+
+void icmp_periodic_cb(struct ev_loop *loop, ev_periodic *w_, int revents){
     struct icmp_periodic *w = (struct icmp_periodic*) w_;
     host* h = (host*)w->host;
     int len_out = offsetof(struct icmp, icmp_data) + DATALEN;
@@ -233,10 +257,15 @@ void icmp_periodic_cb (struct ev_loop *loop, ev_periodic *w_, int revents){
         Result *r;
         r = (Result*)malloc(sizeof(Result));
         r->id = h->count;
+        r->host = h;
         r->t_out = t_out;
+        r->flag_timeout = 0;
+        r->icmp_t.r = r;
+        ev_timer_init(&r->icmp_t.t, icmp_timeout_cb, h->delay, 0);
+        ev_timer_start(loop, &r->icmp_t.t);
         sglib_Result_add(&h->list_result, r);
 
-        printf("Send icmp request %s\n", inet_ntoa(h->addr.sin_addr));
+        //printf("Send icmp request %s\n", inet_ntoa(h->addr.sin_addr));
     }
     h->count++;
 }
@@ -272,10 +301,16 @@ void icmp_cb(struct ev_loop *loop, ev_io *w_, int revents) {
                 if((r = sglib_Result_find_member(h->list_result, &tr)) != NULL){
                     gettimeofday(&t_in, NULL);
                     memcpy(&t_out, icmpin->icmp_data, sizeof(struct timeval));
-                    double delta = (double)(t_out.tv_sec - t_in.tv_sec) + (double)(t_out.tv_usec - t_in.tv_usec) / 1000000;
+                    double delta = (double)(t_in.tv_sec - t_out.tv_sec) + (double)(t_in.tv_usec - t_out.tv_usec) / 1000000;
                     r->t_in = t_in;
                     r->delta = delta;
-                    printf("recv from %s with delta %f\n", inet_ntoa(sout.sin_addr), delta);
+                    ev_timer_stop(loop, &r->icmp_t.t);
+                    if(! r->flag_timeout){
+                        printf("%s %f\n", inet_ntoa(sout.sin_addr), delta);
+                    }else{
+                        printf("%s %f timeouted\n", inet_ntoa(sout.sin_addr), delta);
+                    }
+                    //printf("recv from %s with delta %f\n", inet_ntoa(sout.sin_addr), delta)
                 }else{
                     printf("recv from %s bad icmp :-\\ \n", inet_ntoa(sout.sin_addr));
                 }
