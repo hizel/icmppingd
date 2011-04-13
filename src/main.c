@@ -39,6 +39,15 @@ struct icmp_io{
     int s;
 };
 
+typedef struct Result{
+    uint16_t id;
+    struct timeval t_out;
+    struct timeval t_in;
+    double delta;
+    int dublicate;
+    struct Result *ptr_next;
+    struct Result *ptr_prev;
+} Result;
 
 typedef struct host{
     uint16_t count;
@@ -48,11 +57,14 @@ typedef struct host{
     struct sockaddr_in addr;
     struct icmp_periodic icmp_p;
     int s;
+    Result* list_result;
     struct host *next;
 } host;
 
 
+
 #define HOST_COMPARATOR(e1,e2) (e1->addr.sin_addr.s_addr - e2->addr.sin_addr.s_addr)
+#define RESULT_COMPARATOR(e1,e2) (e1->id - e2->id)
 
 unsigned int hash_function(host *e){
     return e->addr.sin_addr.s_addr;
@@ -62,6 +74,10 @@ SGLIB_DEFINE_LIST_PROTOTYPES(host, HOST_COMPARATOR, next);
 SGLIB_DEFINE_LIST_FUNCTIONS(host, HOST_COMPARATOR, next);
 SGLIB_DEFINE_HASHED_CONTAINER_PROTOTYPES(host, HASH_TAB_SIZE, hash_function);
 SGLIB_DEFINE_HASHED_CONTAINER_FUNCTIONS(host, HASH_TAB_SIZE, hash_function);
+
+SGLIB_DEFINE_DL_LIST_PROTOTYPES(Result, RESULT_COMPARATOR, ptr_prev, ptr_next);
+SGLIB_DEFINE_DL_LIST_FUNCTIONS(Result, RESULT_COMPARATOR, ptr_prev, ptr_next);
+
 
 // global hash
 
@@ -134,6 +150,7 @@ int main(int argc, const char *argv[]){
                 t->s = s; // socket
                 t->icmp_p.host = t;
                 t->count = 0;
+                t->list_result = NULL;
 
                 // start periodic for host
 
@@ -213,6 +230,12 @@ void icmp_periodic_cb (struct ev_loop *loop, ev_periodic *w_, int revents){
     if((n = sendto(s, (char *)icmpout, len_out, 0, (struct sockaddr *)&h->addr, sizeof(struct sockaddr))) < 0){
         printf("fail send icmp %s\n", STRERROR);
     }else{
+        Result *r;
+        r = (Result*)malloc(sizeof(Result));
+        r->id = h->count;
+        r->t_out = t_out;
+        sglib_Result_add(&h->list_result, r);
+
         printf("Send icmp request %s\n", inet_ntoa(h->addr.sin_addr));
     }
     h->count++;
@@ -241,13 +264,21 @@ void icmp_cb(struct ev_loop *loop, ev_io *w_, int revents) {
     seq_in  = ntohs(icmpin->icmp_seq);
     if (icmpin->icmp_type == ICMP_ECHOREPLY) {
         if (id_in == id_out) {
-            host t,*r;
-            t.addr = sout;
-            if((r = sglib_hashed_host_find_member(hosts, &t)) != NULL){
-                gettimeofday(&t_in, NULL);
-                memcpy(&t_out, icmpin->icmp_data, sizeof(struct timeval));
-                double delta = (double)(t_out.tv_sec - t_in.tv_sec) + (double)(t_out.tv_usec - t_in.tv_usec) / 1000000;
-                printf("recv for %s with delta %f\n", inet_ntoa(sout.sin_addr), delta);
+            host th,*h;
+            th.addr = sout;
+            if((h = sglib_hashed_host_find_member(hosts, &th)) != NULL){
+                Result tr,*r;
+                tr.id = seq_in;
+                if((r = sglib_Result_find_member(h->list_result, &tr)) != NULL){
+                    gettimeofday(&t_in, NULL);
+                    memcpy(&t_out, icmpin->icmp_data, sizeof(struct timeval));
+                    double delta = (double)(t_out.tv_sec - t_in.tv_sec) + (double)(t_out.tv_usec - t_in.tv_usec) / 1000000;
+                    r->t_in = t_in;
+                    r->delta = delta;
+                    printf("recv from %s with delta %f\n", inet_ntoa(sout.sin_addr), delta);
+                }else{
+                    printf("recv from %s bad icmp :-\\ \n", inet_ntoa(sout.sin_addr));
+                }
             }
         }
     }
