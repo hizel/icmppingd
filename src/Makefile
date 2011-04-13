@@ -1,8 +1,8 @@
 OBJS=main.o
-HEADERS=
+HEADERS=sglib.h
 
-CFLAGS=-Wall -O2
-LDFLAGS+=-liniparser
+CFLAGS=-Wall -O2 -Wno-unused-variable
+LDFLAGS+=-liniparser -lev
 
 PROG=icmppingd
 CC=clang
